@@ -78,3 +78,37 @@ class ChunkResponse(BaseModel):
     missing_ranges: list[MissingRange]
     fully_received: bool
     expires_at: str
+
+
+class IssueTicketRequest(BaseModel):
+    ttl_minutes: int = Field(
+        ...,
+        ge=1,
+        le=1440,
+        description="票据有效期（分钟），范围 1～1440（1440 = 24 小时）",
+    )
+    max_downloads: int = Field(
+        ...,
+        ge=1,
+        le=100,
+        description="允许的下载总次数，范围 1～100；Range 请求同样按一次计数",
+    )
+
+
+class TicketResponse(BaseModel):
+    """签发成功响应。
+
+    明文 token 仅此一次返回，服务端只保存其 SHA-256；
+    丢失即无法恢复，只能重新签发。
+    """
+
+    token: str
+    download_url: str
+    session_id: str
+    ttl_minutes: int
+    max_downloads: int
+    download_count: int
+    remaining_downloads: int
+    created_at: str
+    expires_at: str
+    revoked: bool

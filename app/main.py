@@ -7,9 +7,15 @@
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
   GET    /sessions/{id}/download        下载成品（仅 completed 可用）
+  POST   /sessions/{id}/tickets         签发受控下载票据（有效期 1～1440 分钟、1～100 次）
+  GET    /tickets/{token}/download      凭票下载（Range 也计一次，剩余次数原子扣减）
+  DELETE /tickets/{token}               撤销票据（幂等）
 """
 from __future__ import annotations
 
+import hashlib
+import re
+import secrets
 import shutil
 import sqlite3
 from contextlib import asynccontextmanager
@@ -23,6 +29,9 @@ from fastapi.responses import FileResponse, RedirectResponse
 from . import db, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
+
+# secrets.token_urlsafe(32) 的实际输出：43 个 URL-safe Base64 字符（无填充）。
+_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +489,161 @@ def download_session(session_id: str) -> FileResponse:
         media_type="application/octet-stream",
         filename=storage.safe_filename(row["filename"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# 受控下载票据
+# ---------------------------------------------------------------------------
+
+def _hash_token(token: str) -> str:
+    """票据只以 SHA-256 形式入库，明文不落盘。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _ticket_payload(row: sqlite3.Row, ttl_minutes: int, token: str) -> dict:
+    return {
+        "token": token,
+        "download_url": f"/api/v1/tickets/{token}/download",
+        "session_id": row["session_id"],
+        "ttl_minutes": ttl_minutes,
+        "max_downloads": row["max_downloads"],
+        "download_count": row["download_count"],
+        "remaining_downloads": row["max_downloads"] - row["download_count"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "revoked": bool(row["revoked"]),
+    }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/tickets",
+    status_code=201,
+    response_model=schemas.TicketResponse,
+    tags=["tickets"],
+)
+def issue_ticket(session_id: str, body: schemas.IssueTicketRequest) -> dict:
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT id FROM upload_sessions WHERE id = ? AND status = 'completed'",
+        (session_id,),
+    ).fetchone()
+    path = storage.artifact_path(session_id)
+    if row is None or not path.is_file():
+        raise _http(404, "no completed artifact for this session")
+
+    token = secrets.token_urlsafe(32)
+    now = storage.utcnow()
+    now_iso = storage.iso(now)
+    expires_iso = storage.iso(now + timedelta(minutes=body.ttl_minutes))
+    with db.immediate() as tx:
+        tx.execute(
+            "INSERT INTO download_tickets ("
+            "token_hash, session_id, max_downloads, download_count, "
+            "created_at, expires_at, revoked"
+            ") VALUES (?, ?, ?, 0, ?, ?, 0)",
+            (
+                _hash_token(token),
+                session_id,
+                body.max_downloads,
+                now_iso,
+                expires_iso,
+            ),
+        )
+        stored = tx.execute(
+            "SELECT * FROM download_tickets WHERE token_hash = ?",
+            (_hash_token(token),),
+        ).fetchone()
+    payload = _ticket_payload(stored, body.ttl_minutes, token)
+    return payload
+
+
+def _consume_ticket(token: str) -> tuple[sqlite3.Row, Path, str]:
+    """在单个 BEGIN IMMEDIATE 事务中完成全部校验并原子扣减一次。
+
+    返回 (票据行, 成品路径, 文件名)。校验失败一律抛 HTTPException，
+    且绝不更新 download_count。
+
+    扣减使用带 ``download_count < max_downloads`` 条件的 UPDATE，
+    配合表上的 CHECK 约束，并发请求在 SQLite 写事务层面被串行化，
+    不可能把下载次数推过上限。成品存在性也在事务内确认，缺文件不计数。
+    """
+    if not _TICKET_RE.match(token):
+        raise _http(404, "ticket not found")
+    token_hash = _hash_token(token)
+    now_iso = storage.iso(storage.utcnow())
+    with db.immediate() as tx:
+        row = tx.execute(
+            "SELECT * FROM download_tickets WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if row is None:
+            raise _http(404, "ticket not found")
+        if row["revoked"]:
+            raise _http(403, "ticket revoked")
+        if row["expires_at"] <= now_iso:
+            raise _http(410, "ticket expired")
+        if row["download_count"] >= row["max_downloads"]:
+            raise _http(403, "ticket download limit reached")
+        session = tx.execute(
+            "SELECT status, filename FROM upload_sessions WHERE id = ?",
+            (row["session_id"],),
+        ).fetchone()
+        if session is None:
+            raise _http(404, "ticket not found")
+        if session["status"] != "completed":
+            raise _http(410, "artifact is no longer available")
+        path = storage.artifact_path(row["session_id"])
+        if not path.is_file():
+            raise _http(404, "artifact is no longer available")
+        cur = tx.execute(
+            "UPDATE download_tickets SET download_count = download_count + 1 "
+            "WHERE token_hash = ? AND revoked = 0 AND expires_at > ? "
+            "AND download_count < max_downloads",
+            (token_hash, now_iso),
+        )
+        if cur.rowcount != 1:
+            # 与并发请求竞争失败（理论上被上面的检查覆盖，防御性兜底）：
+            # 本次不计数，交给客户端重试时收到明确的 4xx。
+            raise _http(403, "ticket download limit reached")
+        ticket = tx.execute(
+            "SELECT * FROM download_tickets WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        return ticket, path, session["filename"]
+
+
+@app.get("/api/v1/tickets/{token}/download", tags=["tickets"])
+def download_with_ticket(token: str) -> FileResponse:
+    # 校验与扣减在同一个 IMMEDIATE 事务内完成：
+    # 未过期 / 未撤销 / 剩余次数充足才扣一次；任何失败都不扣减。
+    ticket, path, filename = _consume_ticket(token)
+    remaining = ticket["max_downloads"] - ticket["download_count"]
+    response = FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=storage.safe_filename(filename),
+    )
+    # 每次 HTTP 请求（含 Range 续传，以及 416 不满足区间）都按一次计数。
+    response.headers["X-Ticket-Remaining-Downloads"] = str(remaining)
+    return response
+
+
+@app.delete("/api/v1/tickets/{token}", status_code=204, tags=["tickets"])
+def revoke_ticket(token: str) -> Response:
+    """撤销票据：之后凭票下载一律 403。
+
+    重复撤销与撤销不存在/格式非法的票据都返回 204，
+    使该接口保持幂等，调用方无需区分撤销前状态。
+    """
+    if not _TICKET_RE.match(token):
+        return Response(status_code=204)
+    token_hash = _hash_token(token)
+    now_iso = storage.iso(storage.utcnow())
+    with db.immediate() as tx:
+        tx.execute(
+            "UPDATE download_tickets SET revoked = 1, revoked_at = ? "
+            "WHERE token_hash = ? AND revoked = 0",
+            (now_iso, token_hash),
+        )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

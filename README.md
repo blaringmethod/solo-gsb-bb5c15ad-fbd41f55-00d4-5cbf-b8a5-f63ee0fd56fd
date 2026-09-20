@@ -42,7 +42,7 @@ docker compose up --build -d
 
 ```
 $DATA_DIR/
-├── resumable.db (+ -wal / -shm)     SQLite 数据库
+├── resumable.db (+ -wal / -shm)     SQLite 数据库（含 download_tickets 票据表，仅存票据哈希）
 ├── files/<session_id>               完成后的成品（原子 rename 落地）
 ├── parts/<session_id>/<start>-<end> 已接收分片
 └── tmp/                             正在接收/拼装的临时文件（启动周期清理）
@@ -134,9 +134,75 @@ POST /api/v1/sessions/{session_id}/complete
 GET /api/v1/sessions/{session_id}/download
 ```
 
-仅 `completed` 会话返回 `200`（支持 `Range` 断点下载续传）；其他状态一律 `404`，失败流程中不存在任何可下载产物。
+仅 `completed` 会话返回 `200`（支持 `Range` 断点下载续传）；其他状态一律 `404`，失败流程中不存在任何可下载产物。该接口**不**受下载票据约束，保持原有行为不变。
 
-### 6. 放弃会话
+### 6. 签发票据（受控下载）
+
+若需要把成品的下载权临时、限量地转交给第三方，可为已完成的会话签发票据：
+
+```http
+POST /api/v1/sessions/{session_id}/tickets
+Content-Type: application/json
+
+{
+  "ttl_minutes": 60,
+  "max_downloads": 5
+}
+```
+
+| 字段 | 范围 | 说明 |
+| --- | --- | --- |
+| `ttl_minutes` | `1`～`1440`（24 小时） | 票据有效期（分钟），到期后凭票下载返回 `410` |
+| `max_downloads` | `1`～`100` | 允许的下载总次数，超出后返回 `403` |
+
+仅 `completed` 会话可签发，否则返回 `404`。返回 `201`：
+
+```json
+{
+  "token": "vRf9...（43 个 URL-safe 随机字符）",
+  "download_url": "/api/v1/tickets/vRf9.../download",
+  "session_id": "...",
+  "ttl_minutes": 60,
+  "max_downloads": 5,
+  "download_count": 0,
+  "remaining_downloads": 5,
+  "created_at": "2026-09-20T12:00:00Z",
+  "expires_at": "2026-09-20T13:00:00Z",
+  "revoked": false
+}
+```
+
+> **明文 `token` 只在签发响应中出现这一次**。服务端仅保存 `SHA-256(token)`（见数据库表 `download_tickets`），无法反查或找回；泄露响应之外的明文等于泄露下载权，请通过安全通道转交。
+
+### 7. 凭票下载
+
+```http
+GET /api/v1/tickets/{token}/download
+```
+
+- 每次 HTTP 请求按一次计数，**`Range` 续传请求（206）、无法满足区间的 416、畸形 Range 的 400 也都计一次**，与完整 200 下载等价。
+- 成功响应带 `X-Ticket-Remaining-Downloads: <剩余次数>` 头。
+- 票据的校验（未过期 / 未撤销 / 剩余次数充足 / 会话仍为 `completed` / 成品仍在磁盘）与次数扣减在**同一个 SQLite `BEGIN IMMEDIATE` 事务**内原子完成；任何一项校验失败都**不会扣减**。扣减 SQL 自带 `download_count < max_downloads` 条件，配合表上的 `CHECK (download_count <= max_downloads)` 约束，并发请求被写事务串行化，成功下载数严格不超过上限。
+
+错误情形：
+
+| 情形 | 状态码 | `detail.error` |
+| --- | --- | --- |
+| 票据不存在 / 格式非法 | `404` | `ticket not found` |
+| 已撤销 | `403` | `ticket revoked` |
+| 已过期 | `410` | `ticket expired` |
+| 次数用尽 | `403` | `ticket download limit reached` |
+| 会话已删除（票据级联删除）/ 成品缺失 | `404` | `ticket not found` / `artifact is no longer available` |
+
+### 8. 撤销票据
+
+```http
+DELETE /api/v1/tickets/{token}
+```
+
+立即作废票据，之后凭票下载一律 `403 ticket revoked`。接口幂等：重复撤销、撤销从未签发或格式非法的票据都返回 `204`。撤销不影响会话本身，也不影响第 5 节的原会话下载接口。
+
+### 9. 放弃会话
 
 ```http
 DELETE /api/v1/sessions/{session_id}
@@ -181,4 +247,4 @@ DATA_DIR=./data uvicorn app.main:app --reload --port 8000
 python3 -m pytest -q
 ```
 
-测试覆盖：乱序完整上传与下载、越界/重叠/长度不符拒绝、缺失区间计算、并发重叠竞态（仅一个成功）、SHA-256 不匹配、空文件、放弃、过期清理与未知会话。
+测试覆盖：乱序完整上传与下载、越界/重叠/长度不符拒绝、缺失区间计算、并发重叠竞态（仅一个成功）、SHA-256 不匹配、空文件、放弃、过期清理与未知会话；以及受控下载票据的签发边界（1～1440 分钟 / 1～100 次）、库内仅存哈希、完整下载与 `Range`/416/400 均计数、上限耗尽/撤销/过期/会话删除等失败路径不扣减、20 并发请求成功数严格等于上限、原会话下载接口行为不变。

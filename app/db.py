@@ -90,6 +90,26 @@ CREATE INDEX IF NOT EXISTS idx_chunks_session_interval
     ON chunks(session_id, start_offset, end_offset);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires
     ON upload_sessions(status, expires_at);
+
+-- 受控下载票据：只存随机票据明文的 SHA-256，数据库泄露也无法直接下载。
+-- download_count <= max_downloads 的 CHECK 与凭票下载时的条件原子更新
+-- 共同保证任何并发组合都不可能突破下载上限。
+CREATE TABLE IF NOT EXISTS download_tickets (
+    token_hash     TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    max_downloads  INTEGER NOT NULL CHECK (max_downloads BETWEEN 1 AND 100),
+    download_count INTEGER NOT NULL DEFAULT 0
+                   CHECK (download_count >= 0 AND download_count <= max_downloads),
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    revoked        INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    revoked_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_session
+    ON download_tickets(session_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_expires
+    ON download_tickets(expires_at);
 """
 
 
