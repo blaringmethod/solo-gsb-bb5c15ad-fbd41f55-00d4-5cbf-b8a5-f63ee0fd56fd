@@ -6,12 +6,18 @@
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间）
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
-  GET    /sessions/{id}/download        下载成品（仅 completed 可用）
+  GET    /sessions/{id}/download        会话下载（原有接口，不计数）
+  POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
+  GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
+  POST   /tickets/{ticket}/revoke       撤销票据
 """
 from __future__ import annotations
 
+import hashlib
+import secrets
 import shutil
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -136,8 +142,6 @@ app = FastAPI(
     tags=["sessions"],
 )
 def create_session(body: schemas.CreateSessionRequest) -> dict:
-    import uuid
-
     session_id = uuid.uuid4().hex
     now_iso, expires_iso = storage.future_expiry()
     storage.ensure_dirs()
@@ -480,6 +484,175 @@ def download_session(session_id: str) -> FileResponse:
         media_type="application/octet-stream",
         filename=storage.safe_filename(row["filename"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# 受控下载票据
+#
+# 明文票据 = 32 字节 URL-safe 随机串（约 256 bit 熵），仅在签发响应中返回一次；
+# 库里只存 SHA-256(token)。凭票下载在单个 BEGIN IMMEDIATE 事务内完成
+# “存在/未撤销/未过期/剩余次数 > 0”全部校验与原子扣减，
+# 条件 UPDATE 配合行级写锁保证并发请求不可能突破次数上限。
+# ---------------------------------------------------------------------------
+
+
+def _ticket_payload(row: sqlite3.Row) -> dict:
+    return {
+        "ticket_id": row["id"],
+        "session_id": row["session_id"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "max_downloads": row["max_downloads"],
+        "remaining_downloads": row["remaining_downloads"],
+        "revoked": bool(row["revoked"]),
+        "download_url": f"/api/v1/tickets/{row['id']}/download",
+    }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/tickets",
+    status_code=201,
+    response_model=schemas.TicketResponse,
+    tags=["tickets"],
+)
+def create_ticket(
+    session_id: str, body: schemas.CreateTicketRequest
+) -> dict:
+    now = storage.utcnow()
+    now_iso = storage.iso(now)
+    expires_iso = storage.iso(
+        now + timedelta(minutes=body.expires_in_minutes)
+    )
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    ticket_id = uuid.uuid4().hex
+
+    # 会话状态/成品检查与票据登记放在同一个 IMMEDIATE 事务，
+    # 票据外键指向 completed 会话；不存在成品则不签发。
+    with db.immediate() as tx:
+        row = tx.execute(
+            "SELECT id FROM upload_sessions WHERE id = ? AND status = 'completed'",
+            (session_id,),
+        ).fetchone()
+        if row is None or not storage.artifact_path(session_id).is_file():
+            raise _http(409, "no completed artifact for this session")
+        tx.execute(
+            "INSERT INTO download_tickets ("
+            "id, session_id, token_hash, max_downloads, remaining_downloads, "
+            "revoked, created_at, expires_at"
+            ") VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                ticket_id,
+                session_id,
+                token_hash,
+                body.max_downloads,
+                body.max_downloads,
+                now_iso,
+                expires_iso,
+            ),
+        )
+        saved = tx.execute(
+            "SELECT * FROM download_tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+
+    payload = _ticket_payload(saved)
+    # 票据随机串本身才是下载凭证；id 只用于拼 URL。
+    payload["ticket"] = f"{ticket_id}.{token}"
+    return payload
+
+
+def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """在单个 IMMEDIATE 事务中校验票据并原子扣减一次。
+
+    返回 (票据行, 会话行)。任一校验失败都抛 HTTPException 且事务回滚，
+    绝不扣减次数。条件 UPDATE 的 rowcount 是并发上限的最终防线。
+    """
+    ticket_id, _, token = credential.partition(".")
+    if not ticket_id or not token:
+        raise _http(404, "ticket not found")
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    now_iso = storage.iso(storage.utcnow())
+
+    with db.immediate() as tx:
+        ticket = tx.execute(
+            "SELECT * FROM download_tickets WHERE id = ? AND token_hash = ?",
+            (ticket_id, token_hash),
+        ).fetchone()
+        if ticket is None:
+            raise _http(404, "ticket not found")
+        if ticket["revoked"]:
+            raise _http(403, "ticket revoked")
+        if ticket["expires_at"] <= now_iso:
+            raise _http(410, "ticket expired")
+        if ticket["remaining_downloads"] <= 0:
+            raise _http(429, "ticket download limit reached")
+
+        session = tx.execute(
+            "SELECT id, filename FROM upload_sessions "
+            "WHERE id = ? AND status = 'completed'",
+            (ticket["session_id"],),
+        ).fetchone()
+        path = storage.artifact_path(ticket["session_id"])
+        if session is None or not path.is_file():
+            raise _http(404, "no completed artifact for this session")
+
+        # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，
+        # 后到者的 remaining_downloads 已是 0，rowcount=0 → 429，绝不超额。
+        cur = tx.execute(
+            "UPDATE download_tickets SET remaining_downloads = remaining_downloads - 1 "
+            "WHERE id = ? AND token_hash = ? AND revoked = 0 "
+            "AND expires_at > ? AND remaining_downloads > 0",
+            (ticket["id"], token_hash, now_iso),
+        )
+        if cur.rowcount != 1:
+            raise _http(429, "ticket download limit reached")
+        ticket = tx.execute(
+            "SELECT * FROM download_tickets WHERE id = ?", (ticket["id"],)
+        ).fetchone()
+    return ticket, session
+
+
+@app.get("/api/v1/tickets/{ticket}/download", tags=["tickets"])
+def download_with_ticket(ticket: str) -> FileResponse:
+    _, session = _claim_ticket_download(ticket)
+    session_id = session["id"]
+    # 校验与扣减已在事务中完成；Range 请求同样走到这里，按一次计数。
+    # FileResponse 原生处理 Range（206）与 If-Modified-Since，凭证不合法时
+    # 在到达此处之前就已抛错，因此失败请求不会扣减。
+    return FileResponse(
+        storage.artifact_path(session_id),
+        media_type="application/octet-stream",
+        filename=storage.safe_filename(session["filename"]),
+    )
+
+
+@app.post(
+    "/api/v1/tickets/{ticket}/revoke",
+    response_model=schemas.TicketInfo,
+    tags=["tickets"],
+)
+def revoke_ticket(ticket: str) -> dict:
+    ticket_id, _, token = ticket.partition(".")
+    if not ticket_id or not token:
+        raise _http(404, "ticket not found")
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    with db.immediate() as tx:
+        row = tx.execute(
+            "SELECT * FROM download_tickets WHERE id = ? AND token_hash = ?",
+            (ticket_id, token_hash),
+        ).fetchone()
+        if row is None:
+            raise _http(404, "ticket not found")
+        # 幂等：已撤销不报错。
+        tx.execute(
+            "UPDATE download_tickets SET revoked = 1 WHERE id = ?", (ticket_id,)
+        )
+        row = tx.execute(
+            "SELECT * FROM download_tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+    return _ticket_payload(row)
 
 
 # ---------------------------------------------------------------------------

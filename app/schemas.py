@@ -78,3 +78,35 @@ class ChunkResponse(BaseModel):
     missing_ranges: list[MissingRange]
     fully_received: bool
     expires_at: str
+
+
+# ---------------------------------------------------------------------------
+# 受控下载票据
+# ---------------------------------------------------------------------------
+
+
+class CreateTicketRequest(BaseModel):
+    expires_in_minutes: int = Field(
+        ..., ge=1, le=1440, description="票据有效期（分钟），1～1440"
+    )
+    max_downloads: int = Field(
+        ..., ge=1, le=100, description="下载次数上限，1～100"
+    )
+
+
+class TicketInfo(BaseModel):
+    """票据的非敏感元数据（撤销接口返回）。"""
+
+    ticket_id: str
+    session_id: str
+    created_at: str
+    expires_at: str
+    max_downloads: int
+    remaining_downloads: int
+    revoked: bool
+    download_url: str
+
+
+class TicketResponse(TicketInfo):
+    # 明文随机票据，仅在签发响应中返回这一次；服务端只存它的哈希。
+    ticket: str = Field(..., description="凭票下载令牌（明文仅本次返回，请妥善保管）")

@@ -60,7 +60,16 @@ def immediate() -> Iterator[sqlite3.Connection]:
         conn.commit()
 
 
-SCHEMA = """
+# ---------------------------------------------------------------------------
+# 结构与迁移
+#
+# 使用 SQLite 的 PRAGMA user_version 记录结构版本，启动时按版本号增量迁移：
+#   v1：upload_sessions / chunks（首个发布版本）
+#   v2：download_tickets（受控下载票据）
+# 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
+# ---------------------------------------------------------------------------
+
+MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS upload_sessions (
     id             TEXT PRIMARY KEY,
     filename       TEXT NOT NULL,
@@ -92,7 +101,45 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires
     ON upload_sessions(status, expires_at);
 """
 
+MIGRATION_2 = """
+-- 受控下载票据：只保存随机票据明文的 SHA-256，明文仅在签发响应中出现一次。
+-- 剩余次数在 IMMEDIATE 事务内原子扣减（见 main._claim_ticket_download）。
+CREATE TABLE IF NOT EXISTS download_tickets (
+    id                  TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL
+                            REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    token_hash          TEXT NOT NULL UNIQUE,
+    max_downloads       INTEGER NOT NULL CHECK (max_downloads BETWEEN 1 AND 100),
+    remaining_downloads INTEGER NOT NULL
+                            CHECK (remaining_downloads >= 0
+                                   AND remaining_downloads <= max_downloads),
+    revoked             INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    created_at          TEXT NOT NULL,
+    expires_at          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_session
+    ON download_tickets(session_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_expires
+    ON download_tickets(revoked, expires_at);
+"""
+
+# 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
+_MIGRATIONS: dict[int, str] = {1: MIGRATION_1, 2: MIGRATION_2}
+LATEST_USER_VERSION = max(_MIGRATIONS)
+
 
 def init_db() -> None:
+    """建库或把现有库增量迁移到最新结构（老数据保留）。"""
     conn = get_conn()
-    conn.executescript(SCHEMA)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        # 全新库：依次执行全部迁移。
+        steps = range(1, LATEST_USER_VERSION + 1)
+    else:
+        # 老库：只补齐缺失的版本。
+        steps = range(version + 1, LATEST_USER_VERSION + 1)
+    for step in steps:
+        conn.executescript(_MIGRATIONS[step])
+        # executescript 会提交事务；user_version 必须在其后单独写入。
+        conn.execute(f"PRAGMA user_version = {step}")
